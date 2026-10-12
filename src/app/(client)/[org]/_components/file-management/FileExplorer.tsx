@@ -20,7 +20,12 @@ import MoveFileModal, { FolderInfo } from "./MoveFile";
 import { FilterOption } from "../sorting/sorting";
 import FilterSection from "../../filter/filterSection";
 import { useParams } from "next/navigation";
-import { GetRequest, PostRequest, PutRequest } from "~/utils/new-request";
+import {
+  DeleteRequest,
+  GetRequest,
+  PostRequest,
+  PutRequest,
+} from "~/utils/new-request";
 import FilePreview from "./FilePreview";
 import Loading from "~/components/ui/loading";
 import DeleteFolderModal from "./DeleteFolderModal";
@@ -184,6 +189,7 @@ const FileExplorer: React.FC<FileExplorerProps> = ({ viewType, folderId }) => {
   const [modalState, setModalState] = useState<ModalState>({ type: null });
   const [folders, setFolders] = useState<FolderInfo[]>([]);
   const [files, setFiles] = useState<FileDetails[]>([]);
+  const [savedPinnedFiles, setSavedPinnedFiles] = useState<FileDetails[]>([]);
   const [isFileInfoOpen, setIsFileInfoOpen] = React.useState(false);
   const [selectedFile, setSelectedFile] = React.useState<FileDetails | null>(
     null
@@ -398,20 +404,53 @@ const FileExplorer: React.FC<FileExplorerProps> = ({ viewType, folderId }) => {
         limit: 10,
       });
 
-      const response = await GetRequest(`/files?${queryString}`);
+      const [response, pinnedResponse] = await Promise.all([
+        GetRequest(`/files?${queryString}`),
+        GetRequest("/files/favorites"),
+      ]);
+
+      let pinnedFileIds: Set<string> | undefined;
+      if (pinnedResponse?.status === 200) {
+        const pinnedData = pinnedResponse.data?.data;
+        const pinnedEntries: unknown = Array.isArray(pinnedData)
+          ? pinnedData
+          : (pinnedData?.files ?? pinnedData?.pinned_files ?? []);
+        const mappedPinnedFiles = (
+          Array.isArray(pinnedEntries) ? pinnedEntries : []
+        ).flatMap((entry: unknown): FileDetails[] => {
+          if (!entry || typeof entry !== "object") return [];
+          const pinnedEntry = entry as Record<string, unknown>;
+          const file =
+            pinnedEntry.file && typeof pinnedEntry.file === "object"
+              ? (pinnedEntry.file as Record<string, unknown>)
+              : pinnedEntry;
+          const mappedFile = mapApiFileToFileDetails(file, channelLabelMap);
+          return mappedFile.id ? [{ ...mappedFile, pinned: true }] : [];
+        });
+        pinnedFileIds = new Set(mappedPinnedFiles.map((file) => file.id));
+        setSavedPinnedFiles(mappedPinnedFiles);
+      } else {
+        showError("Failed to load pinned files");
+      }
+
       if (response?.status === 200) {
         const fetchedFiles = response.data?.data?.files || [];
         fileDetailsCache.current.clear();
         setFiles(
-          fetchedFiles.map((file: Record<string, unknown>) =>
-            mapApiFileToFileDetails(file, channelLabelMap)
-          )
+          fetchedFiles.map((file: Record<string, unknown>) => {
+            const mappedFile = mapApiFileToFileDetails(file, channelLabelMap);
+            return pinnedFileIds
+              ? { ...mappedFile, pinned: pinnedFileIds.has(mappedFile.id) }
+              : mappedFile;
+          })
         );
 
         const pagination = parseFilesListPagination(
           response.data?.data?.pagination
         );
         setTotalFilePages(pagination ? Math.max(1, pagination.totalPages) : 1);
+      } else {
+        showError("Failed to load files");
       }
     } catch (error) {
       console.error("Failed to fetch files:", error);
@@ -714,13 +753,52 @@ const FileExplorer: React.FC<FileExplorerProps> = ({ viewType, folderId }) => {
       setModalState({ type: "rename-folder", data: folderToEdit });
     }
   };
-  const handlePinClick = (fileId: string) => {
-    // TODO: API call to pin/unpin file
-    setFiles((prevFiles) =>
-      prevFiles.map((file) =>
-        file.id === fileId ? { ...file, pinned: !file.pinned } : file
-      )
-    );
+  const handlePinClick = async (fileId: string) => {
+    const file =
+      files.find((item) => item.id === fileId) ??
+      savedPinnedFiles.find((item) => item.id === fileId);
+    if (!file) {
+      showError("File not found");
+      return;
+    }
+
+    const shouldPin = !savedPinnedFiles.some((item) => item.id === fileId);
+
+    try {
+      const response = shouldPin
+        ? await PostRequest(`/files/file/${fileId}/pin`)
+        : await DeleteRequest(`/files/file/${fileId}/pin`);
+
+      if (response?.status !== 200 && response?.status !== 201) {
+        const message =
+          response?.response?.data?.message ||
+          response?.response?.data?.error ||
+          `Failed to ${shouldPin ? "pin" : "unpin"} file`;
+        showError(message);
+        return;
+      }
+
+      setFiles((prevFiles) =>
+        prevFiles.map((item) =>
+          item.id === fileId ? { ...item, pinned: shouldPin } : item
+        )
+      );
+      setSavedPinnedFiles((prevFiles) =>
+        shouldPin
+          ? [
+              ...prevFiles.filter((item) => item.id !== fileId),
+              { ...file, pinned: true },
+            ]
+          : prevFiles.filter((item) => item.id !== fileId)
+      );
+      showSuccess(`File ${shouldPin ? "pinned" : "unpinned"} successfully`);
+    } catch (error: any) {
+      const message =
+        error?.response?.data?.message ||
+        error?.response?.data?.error ||
+        `Failed to ${shouldPin ? "pin" : "unpin"} file`;
+      showError(message);
+    }
   };
   const handleShareClick = (fileId: string) => {
     const fileInfo = displayFiles.find((file) => file.id === fileId);
@@ -872,13 +950,23 @@ const FileExplorer: React.FC<FileExplorerProps> = ({ viewType, folderId }) => {
     };
   }, [selectedFile]);
 
-  const pinnedFiles = useMemo(
-    () => clientSortedFiles.filter((file) => file.pinned),
-    [clientSortedFiles]
-  );
+  const pinnedFiles = useMemo(() => {
+    const currentFilesById = new Map(
+      displayFiles.map((file) => [file.id, file])
+    );
+    return savedPinnedFiles.map((file) => ({
+      ...file,
+      ...currentFilesById.get(file.id),
+      pinned: true,
+    }));
+  }, [savedPinnedFiles, displayFiles]);
   const regularFiles = useMemo(
-    () => clientSortedFiles.filter((file) => !file.pinned),
-    [clientSortedFiles]
+    () =>
+      clientSortedFiles.filter(
+        (file) =>
+          !savedPinnedFiles.some((pinnedFile) => pinnedFile.id === file.id)
+      ),
+    [clientSortedFiles, savedPinnedFiles]
   );
 
   const currentRegularFiles = regularFiles;
